@@ -58,7 +58,7 @@ compounding effect on DBSQ's compression ratio).
 ### 2. Train a real model and quantize it
 
 ```bash
-cd python
+cd ../python
 pip install torch torchvision numpy
 python3 train_mnist.py --model mlp --epochs 5 --out ../cpp/export/mlp
 python3 train_mnist.py --model cnn --epochs 5 --prune-sparsity 0.5 --prune-finetune-epochs 2 --out ../cpp/export/cnn_pruned
