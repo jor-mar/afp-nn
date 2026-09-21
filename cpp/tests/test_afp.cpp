@@ -7,6 +7,7 @@
 #include "afp/afp_tensor.hpp"
 #include "afp/afp_ops.hpp"
 #include "afp/afp_dbsq.hpp"
+#include "afp/afp_hybrid.hpp"
 #include "afp/network.hpp"
 #include "afp/pruning.hpp"
 
@@ -340,6 +341,125 @@ void test_pruning() {
   CHECK(pruned.compression_ratio() > unpruned.compression_ratio());
 }
 
+void test_hybrid_roundtrip_and_compression() {
+  using namespace afp;
+  std::mt19937 rng(21);
+  std::normal_distribution<float> normal(0.0f, 0.05f); // typical NN weight scale
+  const int N = 16 * 500;
+  std::vector<float> data(N);
+  for (auto& v : data) v = normal(rng);
+
+  hybrid::HybridConfig cfg; // default: offset_bits=3, mantissa_bits=2 -> 6 bits/elem
+  auto t = hybrid::HybridTensor::encode(data.data(), N, cfg);
+  std::vector<float> out(N);
+  t.decode(out.data());
+  double sum_abs_err = 0;
+  for (int i = 0; i < N; ++i) sum_abs_err += std::fabs(data[i] - out[i]);
+  double mean_abs_err = sum_abs_err / N;
+  std::printf("  hybrid_roundtrip: bits/elem=%d ratio=%.2fx mean_abs_err=%.6f layer_scale=%d\n",
+              cfg.private_bits(), t.compression_ratio(), mean_abs_err, t.layer_scale());
+  CHECK(t.compression_ratio() > 4.0); // meaningfully beats fixed-16 AFP's 3.2x
+  CHECK(mean_abs_err < 0.01);         // reasonable for a 6-bit/element format
+}
+
+void test_hybrid_offset_width_tradeoff() {
+  // Documents the empirical finding (see afp_hybrid.hpp's header comment):
+  // a 3-bit offset beats a 2-bit offset on BOTH compression and accuracy
+  // for realistic weight-like data, because it lets DBSQ's blocks
+  // actually grow past the 8-element minimum.
+  using namespace afp;
+  std::mt19937 rng(99);
+  std::normal_distribution<float> body(0.0f, 0.03f);
+  std::normal_distribution<float> tail(0.0f, 0.3f);
+  std::bernoulli_distribution is_outlier(0.02);
+  const int N = 16 * 1000;
+  std::vector<float> data(N);
+  for (auto& v : data) v = is_outlier(rng) ? tail(rng) : body(rng);
+
+  auto measure = [&](int offset_bits) {
+    hybrid::HybridConfig cfg;
+    cfg.offset_bits = offset_bits;
+    cfg.mantissa_bits = 1;
+    auto t = hybrid::HybridTensor::encode(data.data(), N, cfg);
+    std::vector<float> out(N);
+    t.decode(out.data());
+    double err = 0;
+    for (int i = 0; i < N; ++i) err += std::fabs(data[i] - out[i]);
+    double avg_block = double(N) / t.blocks().size();
+    return std::make_tuple(t.compression_ratio(), err / N, avg_block);
+  };
+  auto [ratio2, err2, blk2] = measure(2);
+  auto [ratio3, err3, blk3] = measure(3);
+  std::printf("  offset_width: offset=2 ratio=%.2fx err=%.5f avg_block=%.1f | "
+              "offset=3 ratio=%.2fx err=%.5f avg_block=%.1f\n",
+              ratio2, err2, blk2, ratio3, err3, blk3);
+  CHECK(blk3 > blk2); // wider offset lets DBSQ grow blocks further
+  CHECK(err3 <= err2 * 1.05); // and doesn't come out meaningfully worse on accuracy
+}
+
+void test_hybrid_search_matches_natural_max() {
+  // Verifies (rather than merely documents) the finding that for this
+  // relative-mantissa, shared-max-exponent format, exhaustive search
+  // over candidate block exponents never beats the natural max -- tested
+  // against several constructed cases, including ones deliberately
+  // designed to maximize the incentive to go lower (one dominant outlier
+  // plus many far-below "rescuable" small values).
+  using namespace afp;
+  hybrid::HybridConfig cfg;
+  cfg.mantissa_bits = 2;
+
+  auto brute_force_best_delta = [&](const std::vector<float>& data) {
+    int32_t natural_max = std::numeric_limits<int32_t>::min();
+    for (float v : data) { auto fb = decompose_float(v); if (!fb.is_zero) natural_max = std::max(natural_max, fb.exponent); }
+    double best_err = std::numeric_limits<double>::infinity();
+    int best_delta = 0;
+    for (int d = 0; d <= 12; ++d) {
+      int32_t cand = natural_max - d;
+      auto block = hybrid::encode_hybrid_block(data.data(), static_cast<int>(data.size()), cand, cfg);
+      std::vector<float> out(data.size());
+      hybrid::decode_hybrid_block(block, cand, cfg, out.data());
+      double l1 = 0;
+      for (size_t i = 0; i < data.size(); ++i) l1 += std::fabs(data[i] - out[i]);
+      if (l1 < best_err) { best_err = l1; best_delta = d; }
+    }
+    return best_delta;
+  };
+
+  std::vector<std::vector<float>> cases = {
+      {1024.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f},
+      {1000.0f, 999.0f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f},
+  };
+  {
+    std::vector<float> big(512, 0.001f); big[0] = 1e6f;
+    cases.push_back(big);
+  }
+  for (auto& c : cases) {
+    int delta = brute_force_best_delta(c);
+    CHECK(delta == 0); // brute force always confirms natural max is optimal
+  }
+  std::printf("  hybrid_search: brute-force-confirmed natural-max-is-optimal on %zu cases\n", cases.size());
+}
+
+void test_hybrid_dot_product() {
+  using namespace afp;
+  std::mt19937 rng(42);
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  const int N = 300;
+  std::vector<float> a(N), b(N);
+  for (auto& v : a) v = normal(rng);
+  for (auto& v : b) v = normal(rng);
+  hybrid::HybridConfig cfg;
+  auto ta = hybrid::HybridTensor::encode(a.data(), N, cfg);
+  auto tb = hybrid::HybridTensor::encode(b.data(), N, cfg);
+  double d = hybrid::dot_product_native(ta, tb);
+  double truth = 0;
+  for (int i = 0; i < N; ++i) truth += double(a[i]) * double(b[i]);
+  double re = std::fabs(d - truth) / std::max(std::fabs(truth), 1e-6);
+  std::printf("  hybrid_dot_product: afp=%.6f float=%.6f rel_err=%.4f%% (bits/elem=%d)\n",
+              d, truth, re * 100.0, cfg.private_bits());
+  CHECK(re < 0.20); // 6-bit elements -> noticeably more error than AFP8's 9-bit, expected
+}
+
 int main() {
   test_basic_roundtrip();
   test_wide_dynamic_range_truncates_small_values();
@@ -355,6 +475,10 @@ int main() {
   test_dbsq_adapts_block_size_around_outliers();
   test_dbsq_dot_product_matches_float();
   test_pruning();
+  test_hybrid_roundtrip_and_compression();
+  test_hybrid_offset_width_tradeoff();
+  test_hybrid_search_matches_natural_max();
+  test_hybrid_dot_product();
 
   if (g_failures == 0) {
     std::printf("ALL TESTS PASSED\n");
