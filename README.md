@@ -26,7 +26,8 @@ afp_project/
       fastmath.hpp     libm-free fast exp/sigmoid/tanh (bit-trick 2^x construction)
       network.hpp     Dense/Conv2D/MaxPool2D/Flatten network (fixed-block AND DBSQ variants) + manifest loader
     src/quantize_and_benchmark.cpp   main benchmark/quantization harness (--dbsq, --prune, ...)
-    tests/test_afp.cpp     unit tests (codec, DBSQ, pruning, dot product, activations, conv2d)
+    tests/test_afp.cpp     unit tests: core codec, DBSQ, pruning (see `make test-afp`)
+    tests/test_hybrid.cpp     unit tests: hybrid AdaptivFloat+AFP+DBSQ format (see `make test-hybrid`)
     rtl/     Verilog AFP-vs-FP32 dot-product hardware comparison (see rtl/README.md)
     Makefile
   python/
@@ -44,20 +45,19 @@ afp_project/
 
 ```bash
 cd cpp
-make test        # unit tests
+make test        # both unit test suites: test_afp (core codec/DBSQ/pruning) + test_hybrid
 make bench        # end-to-end pipeline smoke test on a random synthetic model
 ```
 
-`make test` exercises: encode/decode round-trip accuracy, the positive-field
-and zero-field bonus-bit optimizations, denormal/graceful-underflow
-behavior, the AFP-native integer dot product against a float reference, the
-bit-native ReLU, the fast activation approximations, an AFP-quantized
-Conv2D layer against its FP32 reference, DBSQ's outlier-driven block-size
-adaptation and its native dot product, pruning (including its
-compounding effect on DBSQ's compression ratio), and the hybrid
-AdaptivFloat+AFP+DBSQ format (round-trip accuracy, its native dot
-product, the offset-width tradeoff, and a brute-force verification of the
-best-exponent-search finding described below).
+`make test` runs `test_afp` (encode/decode round-trip accuracy, the
+positive-field and zero-field bonus-bit optimizations, denormal/graceful-
+underflow behavior, the AFP-native integer dot product against a float
+reference, the bit-native ReLU, the fast activation approximations, an
+AFP-quantized Conv2D layer against its FP32 reference, DBSQ's outlier-
+driven block-size adaptation and its native dot product, and pruning
+including its compounding effect on DBSQ's compression ratio) and
+`test_hybrid` (see "6. Hybrid AdaptivFloat+AFP+DBSQ" below for its own
+breakdown). Run them individually with `make test-afp` / `make test-hybrid`.
 
 ### 2. Train a real model and quantize it
 
@@ -122,70 +122,59 @@ RTL is a carefully-written but simulator-unverified first draft, and that
 README explains exactly what was and wasn't possible to check here.
 
 
-## Quick start
-
-### 1. Build and test the C++ library
+### 6. Hybrid AdaptivFloat+AFP+DBSQ: test suite and usage
 
 ```bash
 cd cpp
-make test        # unit tests
-make bench        # end-to-end pipeline smoke test on a random synthetic model
+make test-hybrid                 # dedicated hybrid test suite (10 test groups, see below)
+# or, if you've already run `make all`/`make test`:
+./build/test_hybrid
 ```
 
-`make test` exercises: encode/decode round-trip accuracy, the positive-field
-and zero-field bonus-bit optimizations, denormal/graceful-underflow
-behavior, the AFP-native integer dot product against a float reference, the
-bit-native ReLU, the fast activation approximations, and an AFP-quantized
-Conv2D layer against its FP32 reference.
+`test_hybrid.cpp` is a dedicated suite (separate from `test_afp.cpp`, so
+each stays focused) covering:
 
-### 2. Train a real model and quantize it
+| Test | What it checks |
+|---|---|
+| `test_roundtrip_various_configs` | Round-trip accuracy across the full `{offset_bits, mantissa_bits}` grid (2-4 x 1-3 bits); more mantissa bits monotonically improves accuracy at fixed offset width |
+| `test_compression_beats_fixed_afp` | Every mantissa width (1-3 bits) beats fixed-16 AFP's 3.2x on realistic weight-like data |
+| `test_layer_scale_is_robust_to_outlier_blocks` | The median-based layer scale (Tier 1) tracks the majority of blocks, not a small minority of outlier-magnitude blocks |
+| `test_delta_clamping_is_graceful` | A block whose exponent is deliberately placed outside the 5-bit delta range degrades gracefully (bounded error, always finite output) instead of corrupting anything |
+| `test_positive_field_bonus_improves_accuracy` | An all-positive block measurably outperforms an equivalent mixed-sign block, and disabling the bonus bit removes the gap (isolates the actual cause) |
+| `test_zero_and_wide_range_handling` | Exact zeros round-trip exactly; values far outside a single block's range truncate gracefully, not to garbage |
+| `test_offset_width_tradeoff` | Re-verifies the "3-bit beats 2-bit offset" finding from the README below |
+| `test_search_matches_brute_force` | The best-exponent search matches a full brute-force sweep (not just documented -- actually checked) on 5 cases, including adversarial ones |
+| `test_dot_product_matches_float` | `hybrid::dot_product_native` accuracy against a float64 reference |
+| `test_edge_cases` | Single-element tensors, sizes not a multiple of 8, and all-zero tensors don't crash or misbehave |
 
-```bash
-cd python
-pip install torch torchvision numpy
-python3 train_mnist.py --model mlp --epochs 5 --out ../cpp/export/mlp
-# or: python3 train_mnist.py --model cnn --epochs 5 --out ../cpp/export/cnn
+Basic usage:
 
-cd ../cpp
-make all
-./build/quantize_and_benchmark export/mlp
+```cpp
+#include "afp/afp_hybrid.hpp"
+
+afp::hybrid::HybridConfig cfg;      // defaults: offset_bits=3, mantissa_bits=2 -> 6 bits/elem
+// cfg.mantissa_bits = 1;           // -> 5 bits/elem, more aggressive
+// cfg.offset_bits = 4;             // wider local dynamic range per block
+// cfg.exp_delta_bits = 6;          // widen if you see delta clamping on your data
+// cfg.best_exp_search_radius = 0;  // default; see "what actually worked" below for why
+
+auto t = afp::hybrid::HybridTensor::encode(data.data(), n, cfg);
+std::vector<float> decoded(n);
+t.decode(decoded.data());
+
+double ratio = t.compression_ratio();     // vs. FP32
+int32_t layer_scale = t.layer_scale();    // the tensor's Tier-1 AdaptivFloat-style scale
+
+// AFP-native dot product (no float materialization on the hot path):
+double dot = afp::hybrid::dot_product_native(tensor_a, tensor_b);
 ```
 
-This sandbox does not have network/PyTorch access, so `train_mnist.py`
-could not actually be executed here -- it is written against stable,
-well-documented `torch`/`torchvision` APIs and its export format was
-validated end-to-end by feeding the C++ harness a synthetic model of the
-same shape (`./build/quantize_and_benchmark --synthetic`, see below).
-
-### 3. No PyTorch available? Run the synthetic smoke test
-
-```bash
-./build/quantize_and_benchmark --synthetic --limit 2000
-```
-
-This builds a randomly-initialized MLP directly in C++, quantizes it to
-AFP, and evaluates both paths against synthetic inputs (labels = the FP32
-model's own argmax, so accuracy measures pure quantization fidelity).
-Typical output:
-
-```
----- Parameter memory footprint ----
-FP32 parameter bytes :      11112 (10.85 KB)
-AFP  parameter bytes :       3632 (3.55 KB)
-Compression ratio    : 3.06x  (paper reports 3.2x vs FP32 ...)
-
----- Accuracy ----
-FP32 accuracy (this harness, 2000 examples): 1.0000
-AFP  accuracy (this harness, 2000 examples): 0.9900
-AFP / FP32 accuracy ratio                : 0.9900  (paper's target: >= 0.99)
-```
-
-The 3.2x figure in the paper is for *weight tensors alone*; our harness's
-`fp32_param_bytes`/`afp_param_bytes` also include biases (kept in FP32 on
-both sides, since they are a tiny fraction of parameter count), which is
-why the measured ratio is a bit below 3.2x. Pass `--no-positive-field` /
-`--no-zero-field` to see the effect of disabling either Section-3.3
-optimization.
+If you see accuracy noticeably worse than expected on your own data, the
+two knobs most likely to matter are `exp_delta_bits` (widen it if a
+handful of blocks have exponents far from the rest of the tensor --
+`test_delta_clamping_is_graceful` shows what under-provisioning this looks
+like) and `offset_bits` (see the offset-width tradeoff finding below
+before shrinking it below 3).
 
 ## Format summary and where it deviates from the paper
 

@@ -1,3 +1,0 @@
-count 10000
-fp32_accuracy 0.972500
-achieved_sparsity 0.000000
