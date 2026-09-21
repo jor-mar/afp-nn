@@ -36,7 +36,7 @@ import argparse
 import sys
 import time
 
-from afp_sim import afp_quantize, compression_ratio
+from python.afp_sim import afp_quantize, compression_ratio
 
 
 def analyze_and_quantize(model_name, prune_sparsity=0.0):
@@ -49,7 +49,7 @@ def analyze_and_quantize(model_name, prune_sparsity=0.0):
     model.eval()
 
     if prune_sparsity > 0.0:
-        from train_mnist import apply_global_magnitude_pruning, measure_sparsity
+        from python.train_mnist import apply_global_magnitude_pruning, measure_sparsity
         apply_global_magnitude_pruning(model, prune_sparsity)
         print(f"Pruned to sparsity={measure_sparsity(model):.4f} (requested {prune_sparsity})")
 

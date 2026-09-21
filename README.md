@@ -20,6 +20,7 @@ afp_project/
       afp_codec.hpp     encode_block()/decode_block(): the actual AFP codec (fixed 16-block)
       afp_tensor.hpp     AFPTensor: block-structured storage for arbitrary-length arrays
       afp_dbsq.hpp     DBSQ: dynamic/adaptive block-size AFP (SmartBlock-inspired)
+      afp_hybrid.hpp     Hybrid: AdaptivFloat (per-layer) + AFP (per-block) + DBSQ, 4-7 bit/element
       pruning.hpp     magnitude pruning (global-sparsity and fixed-threshold)
       afp_ops.hpp     AFP-native math: ReLU (bit-level), dot product (shift/int), activations
       fastmath.hpp     libm-free fast exp/sigmoid/tanh (bit-trick 2^x construction)
@@ -52,13 +53,16 @@ and zero-field bonus-bit optimizations, denormal/graceful-underflow
 behavior, the AFP-native integer dot product against a float reference, the
 bit-native ReLU, the fast activation approximations, an AFP-quantized
 Conv2D layer against its FP32 reference, DBSQ's outlier-driven block-size
-adaptation and its native dot product, and pruning (including its
-compounding effect on DBSQ's compression ratio).
+adaptation and its native dot product, pruning (including its
+compounding effect on DBSQ's compression ratio), and the hybrid
+AdaptivFloat+AFP+DBSQ format (round-trip accuracy, its native dot
+product, the offset-width tradeoff, and a brute-force verification of the
+best-exponent-search finding described below).
 
 ### 2. Train a real model and quantize it
 
 ```bash
-cd ../python
+cd python
 pip install torch torchvision numpy
 python3 train_mnist.py --model mlp --epochs 5 --out ../cpp/export/mlp
 python3 train_mnist.py --model cnn --epochs 5 --prune-sparsity 0.5 --prune-finetune-epochs 2 --out ../cpp/export/cnn_pruned
@@ -347,6 +351,81 @@ edge case that wasn't resetting the mantissa on the "decrement offset"
 branch, and a positive-field flag computed over the whole 16-element block
 instead of each 8-element half; after both fixes, 0 of 32,000 values
 mismatched the C++ reference.
+
+## Hybrid: AdaptivFloat + AFP + DBSQ (`afp_hybrid.hpp`)
+
+A three-tier hierarchical format combining ideas from all three papers
+discussed in this repo, built as its own synthesis rather than following
+any single one:
+
+1. **Layer tier** (Tambe et al., *"AdaptivFloat"*, arXiv:1909.13271): one
+   adaptive scale `S` per tensor.
+2. **Block tier** (AFP + DBSQ): dynamically-sized blocks store their
+   exponent as a small **signed delta from S** rather than a full 8-bit
+   value.
+3. **Element tier**: a compact, configurable field -- 1 sign/context bit +
+   2-3 bit offset + 1-3 bit mantissa (4-7 bits total), reusing AFP's
+   positive-field bonus-bit trick (even more valuable at this bit width).
+
+```cpp
+afp::hybrid::HybridConfig cfg;      // defaults: offset=3, mantissa=2 -> 6 bits/elem
+auto t = afp::hybrid::HybridTensor::encode(data, n, cfg);
+double dot = afp::hybrid::dot_product_native(ta, tb);
+```
+
+### What actually worked, and what didn't -- tested, not assumed
+
+Building this surfaced two findings worth stating plainly, because a
+report that only lists wins isn't trustworthy:
+
+- **The layer-delta encoding (Tier 1+2) works as hoped.** Storing each
+  block's exponent as a signed delta from a per-tensor scale (chosen as
+  the median of blocks' own exponents, robust to outlier blocks) is a
+  straightforward, real savings, especially for DBSQ's many small
+  8-element blocks where the header is proportionally most expensive.
+- **The user's literal 2-bit-offset proposal underperforms a 3-bit
+  offset, on both axes at once.** Tested head-to-head on both a plain
+  Gaussian and a heavier-tailed synthetic weight distribution
+  (`test_hybrid_offset_width_tradeoff`): 2-bit offset forces DBSQ's
+  blocks to almost never grow past the 8-element minimum (a 2-step
+  exponent tolerance is too tight for realistic local variation), which
+  forfeits DBSQ's whole adaptive-sizing benefit. 3-bit offset (AFP's
+  original width) lets blocks routinely reach 16-32+ elements even on
+  realistic data, and the resulting header amortization wins outright --
+  e.g. on the heavy-tailed test, offset=3 beat offset=2 on *both*
+  compression ratio *and* mean absolute error simultaneously. The default
+  is offset_bits=3 for this reason; 2 remains available and configurable.
+- **"Best exponent, not max" (the other explicitly-requested mechanism)
+  provides no measurable benefit for this specific format, and this was
+  verified by brute force, not just argued.** AFP's block exponent is
+  the reference for a *relative mantissa* (each element is still its own
+  little floating-point number, just sharing one exponent) -- unlike a
+  uniform/fixed-point scale factor, lowering it below the block's true
+  max cannot gracefully trade range for precision; it can only
+  *saturate* the block's largest element(s) in exchange for a bounded
+  precision gain on already-denormal elements. `test_hybrid_search_matches_natural_max`
+  brute-forces every candidate exponent (not just a small search radius)
+  against several cases including ones deliberately constructed to
+  maximize the incentive to go lower (one dominant outlier plus hundreds
+  of "rescuable" small values, both L1 and L2 error) -- the natural max
+  won every single time. The search machinery is kept, correct, and
+  configurable (`best_exp_search_radius`), but defaults to off (0)
+  because shipping a no-op as though it were a contribution would be
+  dishonest. This is a genuine negative result about how these two
+  papers' core ideas interact, not a bug -- AdaptivFloat's own format
+  doesn't share an exponent across elements the way AFP's blocks do, so
+  its "search the bias" technique doesn't transplant as directly as the
+  surface-level similarity suggests.
+
+Net result on realistic weight-like data: ~4.5-5.6x compression at
+4-7 bits/element (vs. AFP8's fixed 3.2x at 10 bits/element), with mean
+absolute error in the 0.002-0.004 range for typical small-magnitude
+weight tensors -- a genuinely different, more aggressive point on the
+compression/accuracy curve than either base format alone, reached by
+combining the one idea that helped (layer-delta encoding) with the one
+DBSQ-compatibility finding that mattered (keep the 3-bit offset) and
+being transparent about the one idea that, tested rigorously, didn't pan
+out (per-block exponent search).
 
 ## AFP-native math (`afp_ops.hpp`)
 

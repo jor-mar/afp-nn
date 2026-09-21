@@ -64,6 +64,43 @@ which is a private storage-format detail of the software codec);
 extend the RTL, keep this convention or update both the Verilog and the
 generator together.
 
+## Known issue found and fixed (v1 -> v2)
+
+A first version of `afp_dot_product_top.v` was reported to produce garbage
+on real hardware simulation: `mantissa=-2305843009214349390` (~ -2^61) for
+an 8-block test vector whose expected result was ~-20. Root cause: v1
+picked the *first* block's exponent as a single fixed reference for the
+whole vector and aligned every other block onto it with an **unclamped**
+left shift. Two 16-element blocks of Gaussian-ish data can legitimately
+land 30-40+ exponent steps apart by chance (e.g. one block's 16 samples
+all happening to be unusually small), and shifting a ~40-bit mantissa
+left by that much overflows a 64-bit accumulator and silently wraps to
+garbage -- exactly the reported symptom.
+
+v2 replaces that with a small custom floating-point-style accumulator:
+the running total is kept as a normalized `(mantissa, exponent)` pair,
+each new block is folded in via an align-and-add with a **clamped**
+shift (a block whose magnitude is far below the running total's current
+precision correctly rounds to a negligible contribution, exactly as it
+would in any floating-point sum -- this is not a hack, it's what
+"negligible" means), followed by renormalization so the mantissa can
+never grow unbounded regardless of block count or exponent spread. This
+mirrors `afp::dot_product_native`'s own two-tier design in
+`afp_ops.hpp`: fixed-point accumulation *within* a block (bounded range,
+safe), floating accumulation *across* blocks (unbounded range, needs
+floating-style handling) -- v1's bug used fixed-point-style accumulation
+for the *across-blocks* step too, where it isn't safe.
+
+The new logic was hand-verified in Python (mirroring the exact
+align/clamp/renormalize algorithm the Verilog implements) against an
+adversarial 8-block case with exponents spanning -55 to +56 (111 steps):
+no overflow, and the result matched a double-precision reference to
+~1e-11 relative error. That's the strongest verification possible
+without a Verilog simulator in this environment -- **please still run
+the actual RTL locally and report back if anything looks off**; the
+Verilog port of this algorithm has not been simulator-verified, only the
+underlying algorithm has been.
+
 ## How to build and run (locally, not in this sandbox)
 
 ```bash
