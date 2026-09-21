@@ -114,8 +114,7 @@ g++ -std=c++20 -O2 -I../include gen_testvectors.cpp -o gen_testvectors
 ./gen_testvectors 8 42
 
 # 3. Compile and run the RTL simulation
-iverilog -g2012 -o sim afp_element_decode.v afp_block_dot.v \
-    afp_dot_product_top.v fp32_mac_behavioral.v tb_afp_vs_fp32.v
+iverilog -g2012 -o sim afp_element_decode.v afp_block_dot.v afp_dot_product_top.v fp32_mac_behavioral.v tb_afp_vs_fp32.v
 vvp sim
 
 # 4. (optional) inspect waveforms
